@@ -10,85 +10,107 @@ from typing import Optional
 st.set_page_config(page_title="ITGC Application", layout="wide")
 st.title("📊 ITGC Application")
  
-# Initialize session state for API key
-if "groq_api_key" not in st.session_state:
-    st.session_state.groq_api_key = ""
- 
-# API Key Configuration Section
-st.sidebar.header("🤖 AI Configuration")
-api_key = st.sidebar.text_input(
-    "Enter your Groq API Key:",
-    type="password",
-    value=st.session_state.groq_api_key,
-    help="Get your API key from https://console.groq.com/keys"
-)
- 
-if api_key:
-    st.session_state.groq_api_key = api_key
-    st.sidebar.success("✅ API Key configured!")
- 
-# Helper function for AI integration
-def get_ai_summary(prompt: str, api_key: str) -> Optional[str]:
+
+def flexible_priority_sampling(df, priority_col, sort_col, sample_size_per_category=3):
     """
-    Generate AI summary using Groq API (OpenAI-compatible)
+    Ultra-flexible sampling function that works with ANY priority column values
+    Handles S1, S2, S3, High, Medium, Low, or any other values
     """
-    if not api_key:
-        return "⚠️ Please configure your Groq API key in the sidebar to use AI features."
+    # Create a copy and clean the data
+    df_copy = df.copy()
    
-    try:
-        # Configure OpenAI client for Groq
-        client = openai.OpenAI(
-            api_key=api_key,
-            base_url="https://api.groq.com/openai/v1"
-        )
+    # Handle different data types in the priority column
+    df_copy[priority_col] = df_copy[priority_col].fillna('Unknown')  # Replace NaN with 'Unknown'
+    df_copy[priority_col] = df_copy[priority_col].astype(str).str.strip()  # Convert to string and strip whitespace
+   
+    # Remove empty strings
+    df_copy = df_copy[df_copy[priority_col] != '']
+   
+    if len(df_copy) == 0:
+        return pd.DataFrame(), {}
+   
+    # Get unique values and sort them for consistent ordering
+    unique_priorities = sorted(df_copy[priority_col].unique())
+   
+    st.info(f"🎯 Found priority levels: {', '.join(unique_priorities)}")  # Show user what was found
+   
+    sample_results = []
+    sampling_summary = {}
+   
+    for priority in unique_priorities:
+        priority_subset = df_copy[df_copy[priority_col] == priority].copy()
        
-        response = client.chat.completions.create(
-            model="llama3-8b-8192",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert IT auditor specializing in ITGC (IT General Controls) analysis. Provide professional, concise insights about audit findings, potential root causes, and recommendations."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            max_tokens=500,
-            temperature=0.7
-        )
+        if len(priority_subset) == 0:
+            continue
        
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"❌ Error generating AI summary: {str(e)}"
- 
-def create_ai_insight_section(findings_summary: str, module_name: str):
-    """
-    Create AI insight section with button trigger
-    """
-    if st.button(f"🧠 Generate AI Insights for {module_name}", key=f"ai_button_{module_name}"):
-        if not st.session_state.groq_api_key:
-            st.error("Please configure your Groq API key in the sidebar first.")
-            return
+        # Try to sort by the specified column
+        try:
+            # Check if the sort column contains numeric data
+            if priority_subset[sort_col].dtype in ['int64', 'float64']:
+                sorted_subset = priority_subset.sort_values(by=sort_col, ascending=True, na_last=True)
+            else:
+                # For non-numeric columns, try to convert or sort as string
+                try:
+                    # Try to convert to numeric
+                    priority_subset[sort_col + '_numeric'] = pd.to_numeric(priority_subset[sort_col], errors='coerce')
+                    sorted_subset = priority_subset.sort_values(by=sort_col + '_numeric', ascending=True, na_last=True)
+                    sorted_subset = sorted_subset.drop(columns=[sort_col + '_numeric'])
+                except:
+                    # Fall back to string sorting
+                    sorted_subset = priority_subset.sort_values(by=sort_col, ascending=True, na_last=True)
+        except Exception as e:
+            st.warning(f"Could not sort by {sort_col} for priority {priority}. Using original order.")
+            sorted_subset = priority_subset.copy()
+       
+        total_count = len(sorted_subset)
+       
+        # Sampling logic
+        if total_count <= sample_size_per_category:
+            # Take all records if we have fewer than requested
+            sample = sorted_subset.copy()
+            sample['Sample_Type'] = f'{priority}_All_{total_count}_records'
+            sample_results.append(sample)
            
-        with st.spinner("🤖 Generating AI insights..."):
-            prompt = f"""
-            Analyze the following ITGC {module_name} findings and provide:
-            1. A brief summary of key findings
-            2. Possible root causes for any issues identified
-            3. A sample audit observation or comment
-            4. Recommendations for improvement
+            sampling_summary[priority] = {
+                'total_records': total_count,
+                'samples_taken': total_count,
+                'sampling_method': 'All records (insufficient for top/bottom split)'
+            }
            
-            Findings:
-            {findings_summary}
+        elif total_count <= sample_size_per_category * 2:
+            # Take all records but mark them appropriately
+            sample = sorted_subset.copy()
+            sample['Sample_Type'] = f'{priority}_All_{total_count}_records'
+            sample_results.append(sample)
            
-            If no significant issues are found, acknowledge this and suggest proactive monitoring approaches.
-            """
+            sampling_summary[priority] = {
+                'total_records': total_count,
+                'samples_taken': total_count,
+                'sampling_method': 'All records (close to threshold)'
+            }
+        else:
+            # Take top N and bottom N
+            bottom_sample = sorted_subset.head(sample_size_per_category).copy()
+            top_sample = sorted_subset.tail(sample_size_per_category).copy()
            
-            ai_response = get_ai_summary(prompt, st.session_state.groq_api_key)
+            bottom_sample['Sample_Type'] = f'{priority}_Bottom_{sample_size_per_category}'
+            top_sample['Sample_Type'] = f'{priority}_Top_{sample_size_per_category}'
            
-            with st.expander("🧠 AI-Generated Insights", expanded=True):
-                st.markdown(ai_response)
+            sample_results.append(bottom_sample)
+            sample_results.append(top_sample)
+           
+            sampling_summary[priority] = {
+                'total_records': total_count,
+                'samples_taken': sample_size_per_category * 2,
+                'sampling_method': f'Top {sample_size_per_category} and Bottom {sample_size_per_category}'
+            }
+   
+    # Combine all samples
+    if sample_results:
+        final_sample = pd.concat(sample_results, ignore_index=True)
+        return final_sample, sampling_summary
+    else:
+        return pd.DataFrame(), {}
  
 # User selection
 module = st.radio("Select Module", ["Incident Management", "Change Management"])
@@ -153,18 +175,7 @@ if module == "Change Management":
             st.write(f"Missing Resolved Dates: {missing_resolved}")
             st.write(f"Resolved Before Raised: {resolved_before_raised}")
  
-            # AI Insights Section for Change Management
-            findings_summary = f"""
-            Change Management Analysis Results:
-            - Total Records: {len(df_checked)}
-            - Missing Raised Dates: {missing_raised}
-            - Missing Resolved Dates: {missing_resolved}
-            - Resolved Before Raised (Data Quality Issue): {resolved_before_raised}
-            - Average Days to Resolve: {df_checked['days_to_resolve'].mean():.1f if df_checked['days_to_resolve'].notna().any() else 'N/A'}
-            """
            
-            create_ai_insight_section(findings_summary, "Change Management")
- 
             output = BytesIO()
             df_checked.to_excel(output, index=False)
             output.seek(0)
@@ -176,27 +187,89 @@ if module == "Change Management":
         st.subheader("📄 Full Data with Calculated Fields")
         st.dataframe(st.session_state.df_checked)
  
-        st.subheader("🎯 Sampling Section")
-        sampling_column = st.selectbox("Select Column for Sampling", st.session_state.df_checked.columns.tolist())
-        sample_size = st.number_input("Number of Samples", min_value=1, max_value=len(st.session_state.df_checked), value=5, step=1)
-        method = st.selectbox("Sampling Method", ["Top N (Longest)", "Bottom N (Quickest)", "Random"])
+        st.subheader("🎯 Enhanced Priority-Based Sampling")
+       
+        # Check if we have a priority column
+        priority_columns = [col for col in st.session_state.df_checked.columns if
+                          any(keyword in col.lower() for keyword in ['priority', 'risk', 'severity', 'impact', 'urgency'])]
+       
+        if priority_columns:
+            st.info("💡 Detected potential priority columns. Select the appropriate one for sampling.")
+       
+        priority_column = st.selectbox("Select Priority/Risk Column", st.session_state.df_checked.columns.tolist())
+        sampling_column = st.selectbox("Select Column for Sampling (Numerical)",
+                                     [col for col in st.session_state.df_checked.columns])
+       
+        sample_size_per_cat = st.number_input("Samples per Priority Level (Top + Bottom)",
+                                            min_value=1, max_value=10, value=3, step=1)
+       
+        col1, col2 = st.columns(2)
+       
+        with col1:
+            if st.button("🎲 Generate Priority-Based Sample", key="priority_sample_cm"):
+                sample_df, summary = flexible_priority_sampling(
+                    st.session_state.df_checked,
+                    priority_column,
+                    sampling_column,
+                    sample_size_per_cat
+                )
+               
+                if not sample_df.empty:
+                    st.success(f"✅ Generated {len(sample_df)} sample records")
+                   
+                    # Display sampling summary
+                    st.subheader("📈 Sampling Summary")
+                    for priority, stats in summary.items():
+                        st.write(f"**{priority} Priority:**")
+                        st.write(f"  - Total Records: {stats['total_records']}")
+                        st.write(f"  - Samples Taken: {stats['samples_taken']}")
+                        st.write(f"  - Method: {stats['sampling_method']}")
+                   
+                    # Display sample data
+                    st.subheader("📊 Priority-Based Sample Records")
+                    st.dataframe(sample_df)
+                   
+                    # Download button for sample
+                    sample_output = BytesIO()
+                    with pd.ExcelWriter(sample_output, engine='xlsxwriter') as writer:
+                        sample_df.to_excel(writer, sheet_name='Priority_Sample', index=False)
+                       
+                        # Create summary sheet
+                        summary_df = pd.DataFrame.from_dict(summary, orient='index')
+                        summary_df.to_excel(writer, sheet_name='Sampling_Summary')
+                   
+                    sample_output.seek(0)
+                    st.download_button(
+                        "📥 Download Priority-Based Sample",
+                        data=sample_output,
+                        file_name="priority_based_sample_change_mgmt.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                else:
+                    st.warning("⚠️ No valid data found for sampling")
+       
+        with col2:
+            # Original random sampling (kept for backward compatibility)
+            st.subheader("🎲 Traditional Random Sampling")
+            sample_size = st.number_input("Number of Random Samples", min_value=1, max_value=len(st.session_state.df_checked), value=5, step=1)
+            method = st.selectbox("Sampling Method", ["Top N (Longest)", "Bottom N (Quickest)", "Random"])
  
-        if method == "Top N (Longest)":
-            sample_df = st.session_state.df_checked.sort_values(by=sampling_column, ascending=False).head(sample_size)
-        elif method == "Bottom N (Quickest)":
-            sample_df = st.session_state.df_checked.sort_values(by=sampling_column, ascending=True).head(sample_size)
-        else:
-            sample_df = st.session_state.df_checked.sample(n=sample_size, random_state=1)
+            if method == "Top N (Longest)":
+                sample_df = st.session_state.df_checked.sort_values(by=sampling_column, ascending=False).head(sample_size)
+            elif method == "Bottom N (Quickest)":
+                sample_df = st.session_state.df_checked.sort_values(by=sampling_column, ascending=True).head(sample_size)
+            else:
+                sample_df = st.session_state.df_checked.sample(n=sample_size, random_state=1)
  
-        st.write("📊 Sampled Records")
-        st.dataframe(sample_df)
+            st.write("📊 Traditional Sample Records")
+            st.dataframe(sample_df)
  
-        sample_output = BytesIO()
-        sample_df.to_excel(sample_output, index=False)
-        sample_output.seek(0)
-        st.download_button("📥 Download Sample Records", data=sample_output,
-                           file_name="sampled_requests.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            sample_output = BytesIO()
+            sample_df.to_excel(sample_output, index=False)
+            sample_output.seek(0)
+            st.download_button("📥 Download Traditional Sample", data=sample_output,
+                               file_name="traditional_sample_requests.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
  
 # -------------------------
 # 🧯 INCIDENT MANAGEMENT FLOW
@@ -252,111 +325,153 @@ elif module == "Incident Management":
             st.download_button("📥 Download Updated File", data=df.to_csv(index=False).encode("utf-8"),
                                file_name="updated_incidents.csv", mime="text/csv")
  
-            # 🔁 Random Sampling
-            st.subheader("🎯 Random Sampling")
-            sample_size = st.number_input("Number of Random Samples", min_value=1, max_value=len(df), value=5)
-            if st.button("Generate Incident Sample"):
-                sample_df = df.sample(n=sample_size, random_state=42)
-                st.dataframe(sample_df,height=300, use_container_width=True)
+            # 🔁 Enhanced Priority-Based Sampling for Incidents
+            st.subheader("🎯 Enhanced Priority-Based Sampling")
+           
+            # Check for priority columns
+            priority_columns = [col for col in df.columns if
+                              any(keyword in col.lower() for keyword in ['priority', 'risk', 'severity', 'impact', 'urgency'])]
+           
+            if priority_columns:
+                st.info("💡 Detected potential priority columns. Select the appropriate one for sampling.")
+           
+            priority_column = st.selectbox("Select Priority/Risk Column for Incidents", df.columns.tolist())
+           
+            # Select numerical column for sorting
+            sort_column = st.selectbox("Select Column for Sorting", df.columns.tolist())
+           
+            sample_size_incidents = st.number_input("Samples per Priority Level (Top + Bottom) - Incidents",
+                                                  min_value=1, max_value=10, value=3, step=1)
+           
+            col1, col2 = st.columns(2)
+           
+            with col1:
+                if st.button("🎲 Generate Priority-Based Sample for Incidents", key="priority_sample_incidents"):
+                    sample_df, summary = flexible_priority_sampling(
+                        df,
+                        priority_column,
+                        sort_column,
+                        sample_size_incidents
+                    )
+                   
+                    if not sample_df.empty:
+                        st.success(f"✅ Generated {len(sample_df)} incident sample records")
+                       
+                        # Display sampling summary
+                        st.subheader("📈 Incident Sampling Summary")
+                        for priority, stats in summary.items():
+                            st.write(f"**{priority} Priority:**")
+                            st.write(f"  - Total Records: {stats['total_records']}")
+                            st.write(f"  - Samples Taken: {stats['samples_taken']}")
+                            st.write(f"  - Method: {stats['sampling_method']}")
+                       
+                        # Display sample data
+                        st.subheader("📊 Priority-Based Incident Sample")
+                        st.dataframe(sample_df, height=300, use_container_width=True)
+                       
+                        # Download button for sample
+                        sample_buffer = BytesIO()
+                        with pd.ExcelWriter(sample_buffer, engine='xlsxwriter') as writer:
+                            sample_df.to_excel(writer, sheet_name='Priority_Sample', index=False)
+                           
+                            # Create summary sheet
+                            summary_df = pd.DataFrame.from_dict(summary, orient='index')
+                            summary_df.to_excel(writer, sheet_name='Sampling_Summary')
+                       
+                        sample_buffer.seek(0)
+                        st.download_button(
+                            "📥 Download Priority-Based Incident Sample",
+                            data=sample_buffer.getvalue(),
+                            file_name="priority_based_incident_sample.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                    else:
+                        st.warning("⚠️ No valid priority data found for incident sampling")
+           
+            with col2:
+                # Traditional Random Sampling (kept for backward compatibility)
+                st.subheader("🎲 Traditional Random Sampling")
+                sample_size = st.number_input("Number of Random Samples", min_value=1, max_value=len(df), value=5)
+                if st.button("Generate Traditional Incident Sample"):
+                    sample_df = df.sample(n=sample_size, random_state=42)
+                    st.dataframe(sample_df,height=300, use_container_width=True)
  
-                sample_buffer = BytesIO()
-                sample_df.to_csv(sample_buffer, index=False)
-                st.download_button("📥 Download Sample Records", data=sample_buffer.getvalue(),
-                                   file_name="incident_sample.csv", mime="text/csv")
+                    sample_buffer = BytesIO()
+                    sample_df.to_csv(sample_buffer, index=False)
+                    st.download_button("📥 Download Traditional Sample", data=sample_buffer.getvalue(),
+                                       file_name="traditional_incident_sample.csv", mime="text/csv")
                
             st.subheader("⚠️ Risk Category Threshold Check")
             risk_col = st.selectbox("Select Risk Level Column", df.columns)
  
             if risk_col:
-                # Extract last word (risk level) regardless of delimiter or format
-                df["Parsed_Risk_Level"] = df[risk_col].astype(str).str.extract(r'([Cc]ritical|[Hh]igh|[Mm]edium|[Ll]ow)', expand=False).str.capitalize()
+                # Use flexible approach - no pattern matching, just use all unique values
+                df["Parsed_Risk_Level"] = df[risk_col].fillna('Unknown').astype(str).str.strip()
+               
+                # Show unique risk levels found
+                unique_risks = df["Parsed_Risk_Level"].unique()
+                st.info(f"🎯 Found risk levels: {', '.join(unique_risks)}")
  
                 st.markdown("Define SLA thresholds (in days) for each risk level:")
  
-                # Start-Resolved thresholds
-                crit_threshold = st.number_input("Critical Risk Threshold (Start-Resolved)", min_value=0, value=1)
-                high_threshold = st.number_input("High Risk Threshold (Start-Resolved)", min_value=0, value=2)
+                # Dynamic threshold creation based on found risk levels
+                thresholds_start_resolved = {}
+                thresholds_resolved_close = {}
                
-                med_threshold = st.number_input("Medium Risk Threshold (Start-Resolved)", min_value=0, value=4)
-                low_threshold = st.number_input("Low Risk Threshold (Start-Resolved)", min_value=0, value=6)
+                st.subheader("📅 Start-to-Resolved Thresholds")
+                col1, col2 = st.columns(2)
+               
+                with col1:
+                    for i, risk in enumerate(unique_risks):
+                        if risk != 'Unknown':
+                            thresholds_start_resolved[risk] = st.number_input(
+                                f"{risk} - Start to Resolved (days)",
+                                min_value=0,
+                                value=1 if 'critical' in risk.lower() or 's1' in risk.lower() else
+                                      2 if 'high' in risk.lower() or 's2' in risk.lower() else
+                                      4 if 'medium' in risk.lower() or 's3' in risk.lower() else 6,
+                                step=1,
+                                key=f"start_resolved_{risk}"
+                            )
+               
+                st.subheader("📅 Resolved-to-Close Thresholds")
+                with col2:
+                    for i, risk in enumerate(unique_risks):
+                        if risk != 'Unknown':
+                            thresholds_resolved_close[risk] = st.number_input(
+                                f"{risk} - Resolved to Close (days)",
+                                min_value=0,
+                                value=1 if 'critical' in risk.lower() or 's1' in risk.lower() else
+                                      1 if 'high' in risk.lower() or 's2' in risk.lower() else
+                                      2 if 'medium' in risk.lower() or 's3' in risk.lower() else 3,
+                                step=1,
+                                key=f"resolved_close_{risk}"
+                            )
  
-                # Resolved-Close thresholds
-                crit_close_threshold = st.number_input("Critical Risk Threshold (Resolved-Close)", min_value=0, value=1)
-                high_close_threshold = st.number_input("High Risk Threshold (Resolved-Close)", min_value=0, value=1)
-                med_close_threshold = st.number_input("Medium Risk Threshold (Resolved-Close)", min_value=0, value=2)
-                low_close_threshold = st.number_input("Low Risk Threshold (Resolved-Close)", min_value=0, value=3)
- 
-                # Apply filters
-                def exceeds_threshold(row):
+                # Apply flexible threshold checking
+                def exceeds_flexible_threshold(row):
                     risk = row["Parsed_Risk_Level"]
-                    if risk == "Critical":
-                        return (
-                            (row["Start-Resolved"] is not None and row["Start-Resolved"] > crit_threshold) or
-                            (row["Resolved-Close"] is not None and row["Resolved-Close"] > crit_close_threshold)
-                        )
-                    elif risk == "High":
-                        return (
-                            (row["Start-Resolved"] is not None and row["Start-Resolved"] > high_threshold) or
-                            (row["Resolved-Close"] is not None and row["Resolved-Close"] > high_close_threshold)
-                        )
-                    elif risk == "Medium":
-                        return (
-                            (row["Start-Resolved"] is not None and row["Start-Resolved"] > med_threshold) or
-                            (row["Resolved-Close"] is not None and row["Resolved-Close"] > med_close_threshold)
-                        )
-                    elif risk == "Low":
-                        return (
-                            (row["Start-Resolved"] is not None and row["Start-Resolved"] > low_threshold) or
-                            (row["Resolved-Close"] is not None and row["Resolved-Close"] > low_close_threshold)
-                        )
-                    return False
+                    if risk == 'Unknown' or risk not in thresholds_start_resolved:
+                        return False
+                   
+                    exceeds_start_resolved = (
+                        row["Start-Resolved"] is not None and
+                        not pd.isna(row["Start-Resolved"]) and
+                        row["Start-Resolved"] > thresholds_start_resolved[risk]
+                    )
+                   
+                    exceeds_resolved_close = (
+                        row["Resolved-Close"] is not None and
+                        not pd.isna(row["Resolved-Close"]) and
+                        row["Resolved-Close"] > thresholds_resolved_close[risk]
+                    )
+                   
+                    return exceeds_start_resolved or exceeds_resolved_close
  
-                df["Exceeds_Threshold"] = df.apply(exceeds_threshold, axis=1)
+                df["Exceeds_Threshold"] = df.apply(exceeds_flexible_threshold, axis=1)
                 observations_df = df[df["Exceeds_Threshold"] == True]
  
-                # Incident Management AI Insights Section
-                if not observations_df.empty:
-                    st.warning(f"{len(observations_df)} record(s) exceeded the threshold limits.")
-                    st.dataframe(observations_df, height=200, use_container_width=True)
- 
-                    obs_buffer = BytesIO()
-                    observations_df.to_csv(obs_buffer, index=False)
-                    st.download_button("📥 Download Observations File", data=obs_buffer.getvalue(),
-                                    file_name="incident_observations.csv", mime="text/csv")
-                   
-                    # AI Insights for incidents with threshold violations
-                    avg_start_resolved = df['Start-Resolved'].mean() if df['Start-Resolved'].notna().any() else 0
-                    avg_resolved_close = df['Resolved-Close'].mean() if df['Resolved-Close'].notna().any() else 0
-                   
-                    findings_summary = f"""
-                    Incident Management Analysis Results:
-                    - Total Incidents: {len(df)}
-                    - SLA Violations: {len(observations_df)}
-                    - Violation Rate: {(len(observations_df)/len(df)*100):.1f}%
-                    - Average Start-to-Resolved Time: {avg_start_resolved:.1f} days
-                    - Average Resolved-to-Close Time: {avg_resolved_close:.1f} days
-                    - Risk Level Distribution: {df['Parsed_Risk_Level'].value_counts().to_dict()}
-                    - Most Common Violating Risk Level: {observations_df['Parsed_Risk_Level'].mode().iloc[0] if not observations_df.empty else 'N/A'}
-                    """
-                   
-                else:
-                    st.success("✅ All records are within threshold limits.")
-                   
-                    # AI Insights for compliant incidents
-                    avg_start_resolved = df['Start-Resolved'].mean() if df['Start-Resolved'].notna().any() else 0
-                    avg_resolved_close = df['Resolved-Close'].mean() if df['Resolved-Close'].notna().any() else 0
-                   
-                    findings_summary = f"""
-                    Incident Management Analysis Results:
-                    - Total Incidents: {len(df)}
-                    - SLA Compliance: 100% (No violations found)
-                    - Average Start-to-Resolved Time: {avg_start_resolved:.1f} days
-                    - Average Resolved-to-Close Time: {avg_resolved_close:.1f} days
-                    - Risk Level Distribution: {df['Parsed_Risk_Level'].value_counts().to_dict()}
-                    - All incidents resolved within defined SLA thresholds
-                    """
- 
-                create_ai_insight_section(findings_summary, "Incident Management")
+              
                
                 # ✅ Download full dataset with flags
                 st.subheader("📥 Download Full Data with SLA Checks")
